@@ -1,6 +1,7 @@
-"""Provenance Guard - Milestone 5
-Full system: two detection signals, confidence scoring, transparency labels,
-appeals workflow, rate limiting, and a structured SQLite audit log.
+"""Provenance Guard - with stretch features
+Required system: two signals, scoring, labels, appeals, rate limiting, audit log.
+Stretch 1: third signal (pattern and vocabulary) combined as a weighted ensemble.
+Stretch 2: analytics dashboard (GET /analytics and GET /dashboard).
 """
 import json
 import os
@@ -11,7 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from groq import Groq
@@ -35,14 +36,19 @@ MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 MIN_WORDS = 10
 MAX_REASONING_CHARS = 2000
 
-# ---- scoring constants (all from planning.md sections 1 and 2) ----
+# ---- ensemble scoring constants (planning.md, Stretch 1) ----
 SHORT_TEXT_WORDS = 40
-W_LLM, W_STYLO = 0.60, 0.40
-W_LLM_SHORT, W_STYLO_SHORT = 0.75, 0.25
-DISAGREE_LIMIT = 0.40
+WEIGHTS = (0.50, 0.30, 0.20)         # llm, stylo, pattern for texts of 40+ words
+WEIGHTS_SHORT = (0.70, 0.20, 0.10)   # for texts under 40 words
+DISAGREE_LIMIT = 0.50                # max - min across the three signals
 AI_THRESHOLD = 0.80
 HUMAN_THRESHOLD = 0.35
-GUARD_MIN = 0.60  # both signals must be at least this for likely_ai
+GUARD_LLM = 0.60
+GUARD_STYLO = 0.60
+GUARD_PATTERN = 0.50                 # lower: pattern is the weakest signal
+
+# ---- analytics ----
+ANALYTICS_DISAGREE_LIMIT = 0.40      # spread used for the disagreement-rate metric
 
 # ---- transparency labels (exact text from planning.md section 3) ----
 LABELS = {
@@ -96,6 +102,7 @@ def init_db():
                 confidence REAL,
                 llm_score REAL,
                 stylo_score REAL,
+                pattern_score REAL,
                 llm_reasoning TEXT,
                 status TEXT,
                 appeal_reasoning TEXT,
@@ -104,13 +111,17 @@ def init_db():
             )
             """
         )
+        # Migrate an older database that has no pattern_score column
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(audit_log)")]
+        if "pattern_score" not in cols:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN pattern_score REAL")
 
 
 def log_event(entry):
     fields = [
         "content_id", "creator_id", "event_type", "text", "attribution",
-        "ai_score", "confidence", "llm_score", "stylo_score", "llm_reasoning",
-        "status", "appeal_reasoning", "appeal_timestamp", "notes",
+        "ai_score", "confidence", "llm_score", "stylo_score", "pattern_score",
+        "llm_reasoning", "status", "appeal_reasoning", "appeal_timestamp", "notes",
     ]
     row = {f: entry.get(f) for f in fields}
     row["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -180,11 +191,17 @@ def llm_signal(text):
         return None, None
 
 
-# ---------------------------------------------------------------- signal 2
+# ---------------------------------------------------------------- helpers
 def _clamp(x):
     return max(0.0, min(1.0, x))
 
 
+def _split_sentences(text):
+    """Split on . ! ? followed by space, and on line breaks (so poems work by line)."""
+    return [s.strip() for s in re.split(r"[.!?]+\s+|\n+", text.strip()) if s.strip()]
+
+
+# ---------------------------------------------------------------- signal 2
 def stylometric_signal(text):
     """Pure-Python stylometrics. Returns (stylo_score, details).
 
@@ -195,7 +212,7 @@ def stylometric_signal(text):
     n_words = max(len(words), 1)
 
     # Metric 1: sentence length variation (coefficient of variation)
-    sentences = [s.strip() for s in re.split(r"[.!?]+\s+|\n+", text.strip()) if s.strip()]
+    sentences = _split_sentences(text)
     lengths = [len(s.split()) for s in sentences]
     if len(lengths) >= 2 and statistics.mean(lengths) > 0:
         cv = statistics.pstdev(lengths) / statistics.mean(lengths)
@@ -230,21 +247,66 @@ def stylometric_signal(text):
     return round(stylo, 3), details
 
 
+# ---------------------------------------------------------------- signal 3
+def pattern_signal(text):
+    """Pattern and vocabulary signal (Stretch 1). Returns (pattern_score, details).
+
+    pattern_score is in [0, 1] where 1 = AI-like: the average of
+    sentence opener repetition and long-word rate.
+    """
+    words = text.split()
+    n_words = max(len(words), 1)
+
+    # Metric 1: sentence opener repetition (needs at least 3 sentences)
+    sentences = _split_sentences(text)
+    if len(sentences) >= 3:
+        seen = set()
+        repeated = 0
+        for s in sentences:
+            first = re.sub(r"[^a-z]", "", s.split()[0].lower())
+            if first in seen:
+                repeated += 1
+            seen.add(first)
+        repeat_share = repeated / len(sentences)
+        m1 = _clamp(repeat_share / 0.5)  # 0 -> 0.0, >=50 percent -> 1.0
+    else:
+        repeat_share = None
+        m1 = 0.5  # too few sentences: no evidence either way
+
+    # Metric 2: long-word rate (words with 9+ letters per 100 words)
+    long_words = sum(1 for w in words if len(re.sub(r"[^A-Za-z]", "", w)) >= 9)
+    long_per_100 = long_words / n_words * 100
+    m2 = _clamp((long_per_100 - 4) / (12 - 4))  # <=4 -> 0.0, >=12 -> 1.0
+
+    pattern = (m1 + m2) / 2
+    details = {
+        "opener_repeat_share": None if repeat_share is None else round(repeat_share, 3),
+        "long_words_per_100": round(long_per_100, 2),
+        "m1": round(m1, 3), "m2": round(m2, 3),
+    }
+    return round(pattern, 3), details
+
+
 # ---------------------------------------------------------------- scoring
-def score(llm, stylo, word_count):
-    """Combine both signals. Returns (ai_score, confidence, attribution, notes)."""
+def score(llm, stylo, pattern, word_count):
+    """Combine all three signals.
+
+    Returns (ai_score, confidence, attribution, notes).
+    """
     # LLM failed: never make a confident call without it
     if llm is None:
         return 0.5, 1.0, "uncertain", "llm_unavailable"
 
     notes = []
     if word_count < SHORT_TEXT_WORDS:
-        base = W_LLM_SHORT * llm + W_STYLO_SHORT * stylo
+        w_llm, w_stylo, w_pattern = WEIGHTS_SHORT
         notes.append("short_text_weights")
     else:
-        base = W_LLM * llm + W_STYLO * stylo
+        w_llm, w_stylo, w_pattern = WEIGHTS
+    base = w_llm * llm + w_stylo * stylo + w_pattern * pattern
 
-    if abs(llm - stylo) > DISAGREE_LIMIT:
+    spread = max(llm, stylo, pattern) - min(llm, stylo, pattern)
+    if spread > DISAGREE_LIMIT:
         ai_score = 0.5 + (base - 0.5) * 0.5
         notes.append("signals_disagree")
     else:
@@ -252,7 +314,8 @@ def score(llm, stylo, word_count):
     ai_score = round(ai_score, 3)
 
     # Attribution with the agreement guard on the AI label
-    if ai_score >= AI_THRESHOLD and llm >= GUARD_MIN and stylo >= GUARD_MIN:
+    guard_ok = llm >= GUARD_LLM and stylo >= GUARD_STYLO and pattern >= GUARD_PATTERN
+    if ai_score >= AI_THRESHOLD and guard_ok:
         attribution = "likely_ai"
         confidence = ai_score
     elif ai_score <= HUMAN_THRESHOLD:
@@ -272,6 +335,140 @@ def generate_label(attribution):
     return LABELS[attribution]
 
 
+# ---------------------------------------------------------------- analytics
+def analytics():
+    """Compute dashboard metrics from the audit log (Stretch 2)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        subs = [dict(r) for r in conn.execute(
+            "SELECT * FROM audit_log WHERE event_type = 'submission'")]
+        appeals = [dict(r) for r in conn.execute(
+            "SELECT * FROM audit_log WHERE event_type = 'appeal'")]
+
+    total = len(subs)
+    attributions = ["likely_ai", "uncertain", "likely_human"]
+
+    by_attribution = {}
+    for a in attributions:
+        group = [s for s in subs if s["attribution"] == a]
+        scores = [s["ai_score"] for s in group if s["ai_score"] is not None]
+        by_attribution[a] = {
+            "count": len(group),
+            "percent": round(len(group) / total * 100, 1) if total else 0,
+            "average_ai_score": round(sum(scores) / len(scores), 3) if scores else 0,
+        }
+
+    all_scores = [s["ai_score"] for s in subs if s["ai_score"] is not None]
+
+    appeals_by_attribution = {a: 0 for a in attributions}
+    for ap in appeals:
+        if ap["attribution"] in appeals_by_attribution:
+            appeals_by_attribution[ap["attribution"]] += 1
+
+    # Additional metric: how often the signals disagree
+    llm_failures = 0
+    measurable = 0
+    disagreements = 0
+    for s in subs:
+        if s["llm_score"] is None:
+            llm_failures += 1
+            continue
+        vals = [v for v in (s["llm_score"], s["stylo_score"], s["pattern_score"]) if v is not None]
+        if len(vals) >= 2:
+            measurable += 1
+            if max(vals) - min(vals) > ANALYTICS_DISAGREE_LIMIT:
+                disagreements += 1
+
+    return {
+        "total_submissions": total,
+        "by_attribution": by_attribution,
+        "average_ai_score": round(sum(all_scores) / len(all_scores), 3) if all_scores else 0,
+        "total_appeals": len(appeals),
+        "appeal_rate": round(len(appeals) / total, 3) if total else 0,
+        "appeals_by_attribution": appeals_by_attribution,
+        "signal_disagreement_rate": round(disagreements / measurable, 3) if measurable else 0,
+        "signal_disagreement_count": disagreements,
+        "llm_failures": llm_failures,
+    }
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Provenance Guard Dashboard</title>
+<style>
+  :root { --bg:#ffffff; --fg:#1a1a1a; --muted:#666; --card:#f4f4f6; --bar:#3b6fd4; --line:#ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181d; --fg:#ececec; --muted:#a0a0a8; --card:#22252c; --bar:#6c97ee; --line:#3a3d46; }
+  }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg);
+         max-width: 780px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--card); border-radius: 10px; padding: 14px; }
+  .card .n { font-size: 1.6rem; font-weight: 600; }
+  .card .l { color: var(--muted); font-size: 0.85rem; }
+  h2 { font-size: 1.05rem; margin: 24px 0 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); font-size: 0.92rem; }
+  .barwrap { background: var(--card); border-radius: 6px; height: 12px; width: 100%; }
+  .bar { background: var(--bar); height: 12px; border-radius: 6px; }
+  .note { color: var(--muted); font-size: 0.85rem; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Provenance Guard Dashboard</h1>
+<div class="sub">Computed live from the audit log.</div>
+<div id="root">Loading...</div>
+<script>
+const NAMES = { likely_ai: "Likely AI", uncertain: "Uncertain", likely_human: "Likely human" };
+function pct(x) { return (x * 100).toFixed(1) + "%"; }
+function card(n, l) {
+  const d = document.createElement("div"); d.className = "card";
+  const a = document.createElement("div"); a.className = "n"; a.textContent = n;
+  const b = document.createElement("div"); b.className = "l"; b.textContent = l;
+  d.append(a, b); return d;
+}
+function cell(tr, text) { const td = document.createElement("td"); td.textContent = text; tr.appendChild(td); return td; }
+fetch("/analytics").then(r => r.json()).then(d => {
+  const root = document.getElementById("root"); root.textContent = "";
+  if (!d.total_submissions) { root.textContent = "No data yet. Submit some text first."; return; }
+  const grid = document.createElement("div"); grid.className = "grid";
+  grid.append(
+    card(d.total_submissions, "Total submissions"),
+    card(d.total_appeals, "Appeals filed"),
+    card(pct(d.appeal_rate), "Appeal rate"),
+    card(pct(d.signal_disagreement_rate), "Signal disagreement rate")
+  );
+  root.appendChild(grid);
+
+  const h1 = document.createElement("h2"); h1.textContent = "Detection results by attribution"; root.appendChild(h1);
+  const t1 = document.createElement("table");
+  const head = t1.insertRow(); ["Attribution", "Count", "Share", "Avg AI score", "Appeals"].forEach(x => { const th = document.createElement("th"); th.textContent = x; head.appendChild(th); });
+  for (const k of ["likely_ai", "uncertain", "likely_human"]) {
+    const row = t1.insertRow(); const g = d.by_attribution[k];
+    cell(row, NAMES[k]); cell(row, g.count);
+    const sc = cell(row, ""); const w = document.createElement("div"); w.className = "barwrap";
+    const b = document.createElement("div"); b.className = "bar"; b.style.width = g.percent + "%"; w.appendChild(b);
+    sc.append(g.percent + "%", w);
+    cell(row, g.average_ai_score); cell(row, d.appeals_by_attribution[k]);
+  }
+  root.appendChild(t1);
+
+  const n = document.createElement("div"); n.className = "note";
+  n.textContent = "Signal disagreement rate: share of submissions where the highest and lowest signal scores differ by more than 0.40. "
+    + d.signal_disagreement_count + " submission(s) disagreed. LLM failures (excluded from that rate): " + d.llm_failures + ".";
+  root.appendChild(n);
+}).catch(() => { document.getElementById("root").textContent = "Could not load analytics."; });
+</script>
+</body>
+</html>
+"""
+
+
 # ---------------------------------------------------------------- routes
 @app.route("/submit", methods=["POST"])
 @limiter.limit(SUBMIT_LIMIT)
@@ -288,8 +485,11 @@ def submit():
 
     content_id = str(uuid.uuid4())
     llm_score, llm_reasoning = llm_signal(text)
-    stylo_score, _details = stylometric_signal(text)
-    ai_score, confidence, attribution, notes = score(llm_score, stylo_score, word_count)
+    stylo_score, _sd = stylometric_signal(text)
+    pattern_score, _pd = pattern_signal(text)
+    ai_score, confidence, attribution, notes = score(
+        llm_score, stylo_score, pattern_score, word_count
+    )
 
     label = generate_label(attribution)
     status = "classified"
@@ -305,6 +505,7 @@ def submit():
             "confidence": confidence,
             "llm_score": llm_score,
             "stylo_score": stylo_score,
+            "pattern_score": pattern_score,
             "llm_reasoning": llm_reasoning,
             "status": status,
             "notes": notes,
@@ -318,7 +519,11 @@ def submit():
             "attribution": attribution,
             "ai_score": ai_score,
             "confidence": confidence,
-            "signals": {"llm_score": llm_score, "stylo_score": stylo_score},
+            "signals": {
+                "llm_score": llm_score,
+                "stylo_score": stylo_score,
+                "pattern_score": pattern_score,
+            },
             "label": label,
             "status": status,
         }
@@ -366,6 +571,7 @@ def appeal():
             "confidence": original["confidence"],
             "llm_score": original["llm_score"],
             "stylo_score": original["stylo_score"],
+            "pattern_score": original["pattern_score"],
             "llm_reasoning": original["llm_reasoning"],
             "status": "under_review",
             "appeal_reasoning": reasoning,
@@ -388,6 +594,16 @@ def appeal():
 def view_log():
     limit = request.args.get("limit", default=50, type=int)
     return jsonify({"entries": read_log(limit)})
+
+
+@app.route("/analytics", methods=["GET"])
+def view_analytics():
+    return jsonify(analytics())
+
+
+@app.route("/dashboard", methods=["GET"])
+def view_dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
 @app.errorhandler(429)

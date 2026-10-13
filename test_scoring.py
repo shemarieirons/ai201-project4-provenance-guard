@@ -1,30 +1,34 @@
 """Run with: python test_scoring.py
 
 Part 1 tests score() offline with hand-picked inputs (no API calls).
-Part 2 runs the reference texts through both real signals and prints a table
+Part 2 runs the reference texts through all three real signals and prints a table
 you can paste into your README.
 """
-from app import llm_signal, score, stylometric_signal
+from app import llm_signal, pattern_signal, score, stylometric_signal
 
 # ---------------------------------------------------------------- part 1
-print("PART 1: score() unit tests (llm, stylo, word_count)")
+print("PART 1: score() unit tests (llm, stylo, pattern, word_count)")
 cases = [
-    # (llm, stylo, words, expected attribution)
-    (0.9, 0.9, 60, "likely_ai"),
-    (0.9, 0.2, 60, "uncertain"),     # signals disagree
-    (0.2, 0.2, 60, "likely_human"),
-    (None, 0.8, 60, "uncertain"),    # LLM failed
-    (0.95, 0.5, 60, "uncertain"),    # guard: stylo below 0.60, blocks AI label
-    (0.6, 0.6, 60, "uncertain"),     # mid scores
-    (0.97, 0.58, 60, "uncertain"),   # score >= 0.80 but stylo < 0.60, guard blocks AI label
+    # (llm, stylo, pattern, words, expected attribution, expected note fragment)
+    (0.9, 0.9, 0.9, 60, "likely_ai", None),
+    (0.9, 0.2, 0.2, 60, "uncertain", "signals_disagree"),         # spread 0.7 > 0.5
+    (0.2, 0.2, 0.2, 60, "likely_human", None),
+    (None, 0.8, 0.8, 60, "uncertain", "llm_unavailable"),         # LLM failed
+    (0.97, 0.58, 0.9, 60, "uncertain", "ai_guard_downgrade"),     # stylo below 0.60
+    (0.95, 0.9, 0.48, 60, "uncertain", "ai_guard_downgrade"),     # pattern below 0.50
+    (0.97, 0.9, 0.4, 60, "uncertain", "signals_disagree"),        # spread 0.57 > 0.5
+    (0.6, 0.6, 0.6, 60, "uncertain", None),                       # mid scores
+    (0.9, 0.9, 0.9, 30, "likely_ai", "short_text_weights"),       # short text weights
 ]
 ok = True
-for llm, stylo, words, expected in cases:
-    ai, conf, attr, notes = score(llm, stylo, words)
-    flag = "PASS" if attr == expected else "FAIL"
-    if attr != expected:
+for llm, stylo, pattern, words, expected, note_frag in cases:
+    ai, conf, attr, notes = score(llm, stylo, pattern, words)
+    good = attr == expected and (note_frag is None or (notes and note_frag in notes))
+    if not good:
         ok = False
-    print(f"  {flag}  llm={llm} stylo={stylo} -> ai={ai} conf={conf} {attr} ({notes})")
+    flag = "PASS" if good else "FAIL"
+    print(f"  {flag}  llm={llm} stylo={stylo} pattern={pattern} w={words} "
+          f"-> ai={ai} conf={conf} {attr} ({notes})")
 print("  All unit tests passed.\n" if ok else "  SOME TESTS FAILED.\n")
 
 # ---------------------------------------------------------------- part 2
@@ -63,13 +67,14 @@ TEXTS = {
 }
 
 print("PART 2: reference inputs (uses the Groq API)")
-print(f"{'Input':<18} {'llm':>5} {'stylo':>6} {'ai_score':>9} {'conf':>6}  attribution")
-print("-" * 70)
+print(f"{'Input':<18} {'llm':>5} {'stylo':>6} {'pattern':>8} {'ai_score':>9} {'conf':>6}  attribution")
+print("-" * 80)
 for name, text in TEXTS.items():
     llm, _reason = llm_signal(text)
-    stylo, details = stylometric_signal(text)
-    ai, conf, attr, notes = score(llm, stylo, len(text.split()))
+    stylo, _sd = stylometric_signal(text)
+    pattern, pdetails = pattern_signal(text)
+    ai, conf, attr, notes = score(llm, stylo, pattern, len(text.split()))
     llm_str = "None" if llm is None else f"{llm:.2f}"
-    print(f"{name:<18} {llm_str:>5} {stylo:>6.2f} {ai:>9.3f} {conf:>6.3f}  {attr}"
+    print(f"{name:<18} {llm_str:>5} {stylo:>6.2f} {pattern:>8.2f} {ai:>9.3f} {conf:>6.3f}  {attr}"
           + (f"  [{notes}]" if notes else ""))
-    print(f"{'':<18} metrics: {details}")
+    print(f"{'':<18} pattern metrics: {pdetails}")
