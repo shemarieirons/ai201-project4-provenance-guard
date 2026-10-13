@@ -341,4 +341,72 @@ I will use AI assistance to help implement the project, but I will use this docu
 
 ### Stretch features
 
-I have not started any stretch features yet. Before implementing one, I will update this document with the design and explain how the new feature will fit into the existing system. My first choice would be to add a third detection signal based on repetition and n-gram overlap, with its contribution to the final score documented before implementation.
+The required system is complete and tested. I am adding two stretch features. This section was written before building either one. Each feature gets a design, a test plan, and an AI tool plan.
+
+#### Stretch 1: Ensemble detection (third signal)
+
+**Goal.** Add a third, independent signal and combine all three with a documented weighting, so the final score does not depend on just one LLM call (which I saw vary between 0.65 and 0.8 on identical text) plus one set of statistics.
+
+**Signal 3: Pattern and vocabulary signal (pure Python).** It looks at how sentences begin and at how sophisticated the vocabulary is, which is different from the first two signals: the LLM reads meaning, signal 2 measures sentence length, punctuation, and stock phrases, and signal 3 measures opener repetition and word length. Returns a score from 0 to 1 (1 = AI-like), the average of two metrics:
+
+| Metric | How computed | Why it differs | Normalization (linear, clamped) |
+|---|---|---|---|
+| **Sentence opener repetition** | Using the same sentence splitter as signal 2, take the first word (lowercased) of each sentence. The metric is the share of sentences whose opener already appeared in an earlier sentence. Needs at least 3 sentences, otherwise neutral 0.5. | AI text often starts sentences with the same few words ("The", "It", "Furthermore"). Humans vary openers more. | 0 repeated openers maps to 0.0. 50 percent or more maps to 1.0. |
+| **Long-word rate** | Words with 9 or more letters (after stripping punctuation) per 100 words. | AI prose leans on long abstract words ("implications", "multifaceted", "responsible"). Casual human writing uses shorter words. | 4 or fewer per 100 maps to 0.0. 12 or more maps to 1.0. |
+
+**Blind spots of signal 3.** Formal human writing (academic, legal) uses long words and can repeat openers, so it will look AI-like. Poems with deliberate repetition ("The rain falls... The rain falls...") will have high opener repetition. This is why signal 3 gets the lowest weight. Very short texts give unreliable results, so the metric is neutral under 3 sentences.
+
+**Combining three signals (weighted average).** Let `llm`, `stylo`, and `pattern` be the three scores.
+
+1. **Base score.**
+   - Text of 40 words or more: `base = 0.50 * llm + 0.30 * stylo + 0.20 * pattern`
+   - Text under 40 words: `base = 0.70 * llm + 0.20 * stylo + 0.10 * pattern`
+2. **Disagreement penalty.** If `max(llm, stylo, pattern) - min(llm, stylo, pattern) > 0.50`, then `ai_score = 0.5 + (base - 0.5) * 0.5`. Otherwise `ai_score = base`. The limit is 0.50 and not 0.40 because three signals naturally spread out more than two, and the weakest signal should not trigger the penalty alone.
+3. **LLM failure.** Unchanged: `ai_score = 0.5`, attribution `uncertain`, note `llm_unavailable`.
+4. **Agreement guard for the AI label.** `likely_ai` requires `ai_score >= 0.80` and `llm >= 0.60` and `stylo >= 0.60` and `pattern >= 0.50`. The pattern threshold is lower because it is the weakest signal. If the score reaches 0.80 but any condition fails, the result is downgraded to `uncertain` with note `ai_guard_downgrade`.
+5. **Thresholds and labels** are unchanged (0.80 and 0.35), so the label text and appeals logic do not change.
+
+**Why weighted average and not voting.** Voting throws away how strong each signal was, and with three signals a 2 to 1 vote would let the two statistical signals outvote the LLM on formal human writing. A weighted average keeps the LLM as the strongest signal and still lets the others pull the score.
+
+**Changes to the API and log.**
+- `/submit` response: `signals` gains `pattern_score` (so it holds `llm_score`, `stylo_score`, `pattern_score`).
+- Audit log: new column `pattern_score REAL`. Because SQLite does not add columns to an existing table automatically, delete `audit_log.db` before restarting, or run `ALTER TABLE audit_log ADD COLUMN pattern_score REAL`.
+
+**How I will test it.**
+1. Unit-test the new `score()` offline with hand-picked inputs, including: all three high (expect `likely_ai`), all three low (expect `likely_human`), `llm` high with `pattern` below 0.50 (guard downgrade), and a wide spread (penalty applied).
+2. Re-run the six reference texts and record all three signal scores in a new table.
+3. Check the original pass criteria still hold: clearly AI above 0.70, clearly human below 0.40, a gap of at least 0.30, and the formal human, lightly edited AI, and repetitive poem inputs still land in `uncertain`.
+4. Compare the new table to the two-signal table. If the ensemble pushes the repetitive poem or formal human text toward `likely_ai`, lower the pattern weight and document the change.
+
+**AI tool plan for Stretch 1.**
+- **Give the AI:** this Stretch 1 section, the existing `stylometric_signal` and `score` functions, and the architecture diagram.
+- **Ask for:** `pattern_signal(text)` with the two metrics and ranges above, an updated `score(llm, stylo, pattern, word_count)` implementing the weights, penalty, and guard exactly as written, the `pattern_score` log column, and updated tests in `test_scoring.py`.
+- **Verify:** compare every constant to this section (weights 0.50/0.30/0.20 and 0.70/0.20/0.10, spread limit 0.50, guard thresholds 0.60/0.60/0.50), run the unit tests, then run the reference table and check the pass criteria above.
+
+#### Stretch 2: Analytics dashboard
+
+**Goal.** A simple view of detection patterns, appeal rates, and one extra metric, built from the existing audit log.
+
+**Endpoints.**
+- `GET /analytics` returns JSON computed from the log.
+- `GET /dashboard` returns a single HTML page that fetches `/analytics` and shows the numbers in plain tables and bars. No external libraries.
+
+**Metrics (all computed from rows where `event_type = 'submission'` unless noted).**
+
+| Metric | Definition |
+|---|---|
+| `total_submissions` | Count of submission rows. |
+| `by_attribution` | Count and percentage for `likely_ai`, `uncertain`, `likely_human`. |
+| `average_ai_score` | Mean `ai_score` overall and per attribution. |
+| `total_appeals` and `appeal_rate` | Count of rows with `event_type = 'appeal'`, and appeals divided by submissions. |
+| `appeals_by_attribution` | Appeals grouped by the original attribution, to show which labels creators contest most. |
+| **Additional metric: `signal_disagreement_rate`** | Share of submissions where the spread between the highest and lowest signal score is above 0.40. This shows how often the signals conflict, which is where the system is least trustworthy. Submissions with a missing LLM score are excluded and counted separately as `llm_failures`. |
+
+**Edge cases.** With zero submissions, percentages and rates return 0, never a division error. The dashboard shows a "No data yet" message. There is no authentication, so like `/log` this is for local and grading visibility only, and a real system would restrict it.
+
+**How I will test it.** Submit several different texts and file at least one appeal, then check that `/analytics` counts match the `/log` output by hand (totals, per-attribution counts, appeal rate). Open `/dashboard` in a browser and confirm it matches. Test with an empty database to confirm no crash.
+
+**AI tool plan for Stretch 2.**
+- **Give the AI:** this Stretch 2 section and the audit log schema from Section 6.
+- **Ask for:** an `analytics()` function that reads the SQLite log and returns the metrics above, the `/analytics` route, and a self-contained `/dashboard` HTML page.
+- **Verify:** hand-count from `/log` and compare to `/analytics`, test the empty-database case, and open the page in a browser.
